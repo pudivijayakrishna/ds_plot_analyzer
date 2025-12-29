@@ -44,19 +44,3 @@ A specialized, multimodal AI application built for **M.Tech Data Science** stude
    streamlit run app.py
 ---
 
-### **How to Add This to Your Project**
-
-1.  **In VS Code:** Create a new file named `README.md`.
-2.  **Paste the content:** Copy the text above and paste it in. Make sure to replace `[PASTE_YOUR_STREAMLIT_URL_HERE]` with your actual link.
-3.  **Save and Sync:**
-    * Click the **Source Control** icon.
-    * Click **+** to stage the README.
-    * Type `"Add professional README"` as the message.
-    * Click **Commit** and then **Sync Changes**.
-
-
-
-### **Final Touch: The "About" Section**
-On your GitHub repository page (in your browser), click the **Gear Icon** ⚙️ next to "About" on the right side. Paste your Streamlit URL into the **Website** field. This makes it incredibly easy for anyone to click and see your work instantly!
-
-**Would you like me to help you draft a short LinkedIn post to share this project with your network?**
