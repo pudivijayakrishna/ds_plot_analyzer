@@ -1,0 +1,5 @@
+streamlit
+huggingface_hub
+fpdf2
+graphviz
+pillow
