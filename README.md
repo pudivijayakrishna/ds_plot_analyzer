@@ -1,8 +1,8 @@
 # 🤖 Data Science Logic & Flow Assistant
 
-A specialized, multimodal AI application built for **M.Tech Data Science** students and educators. This tool provides dual-persona explanations (Kid-friendly vs. Academic) and generates dynamic logical flowcharts using Graphviz.
+A specialized, multimodal AI application built for **Data Science** students and educators. This tool provides dual-persona explanations (Kid-friendly vs. Academic) and generates dynamic logical flowcharts using Graphviz.
 
-**🚀 Live App:** [PASTE_YOUR_STREAMLIT_URL_HERE]
+**🚀 Live App:** https://dsplotanalyzer-aa3ukbsyygiutul5whz4by.streamlit.app/
 
 ---
 
