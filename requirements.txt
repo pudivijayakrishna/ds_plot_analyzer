@@ -1,5 +1,8 @@
 streamlit
 huggingface_hub
-fpdf2
+tenacity
 graphviz
-pillow
+playwright
+markdown
+nest_asyncio
+pydantic
