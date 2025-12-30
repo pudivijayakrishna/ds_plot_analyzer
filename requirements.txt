@@ -6,3 +6,5 @@ playwright
 markdown
 nest_asyncio
 pydantic
+matplotlib
+google-generativeai
