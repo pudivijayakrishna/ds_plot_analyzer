@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import asyncio
 import json
 import re
@@ -11,18 +12,19 @@ import uuid
 import warnings
 from typing import Optional
 from pydantic import BaseModel
-from huggingface_hub import InferenceClient
+import google.generativeai as genai
 from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
 import nest_asyncio
 import graphviz
 from playwright.async_api import async_playwright, Browser, Playwright
 
 # --- 0. PRODUCTION SETUP ---
-PROMPT_VERSION = "25.0.0-EmergencyFix"
+PROMPT_VERSION = "46.0.0-Platinum"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Suppress warnings to keep UI clean
+# --- CONFIGURATION: Silence Warnings ---
+os.environ["STREAMLIT_hush"] = "1"
 warnings.filterwarnings("ignore")
 
 nest_asyncio.apply()
@@ -47,8 +49,15 @@ def get_browser_instance():
         global _PLAYWRIGHT, _BROWSER
         if _BROWSER is None:
             _PLAYWRIGHT = await async_playwright().start()
-            # Add args for cloud stability
-            _BROWSER = await _PLAYWRIGHT.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
+            _BROWSER = await _PLAYWRIGHT.chromium.launch(
+                args=[
+                    "--no-sandbox", 
+                    "--disable-setuid-sandbox", 
+                    "--disable-dev-shm-usage",
+                    "--single-process", 
+                    "--disable-gpu"
+                ]
+            )
         return _BROWSER
     return run_async(init_browser())
 
@@ -60,13 +69,12 @@ def cleanup_resources():
 
 # --- 2. CONFIGURATION ---
 class AppConfig:
-    HF_TOKEN = st.secrets.get("HF_TOKEN") or os.getenv("HF_TOKEN")
+    GEMINI_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
     
-    # Model Redundancy List
     MODEL_LIST = [
-        "Qwen/Qwen2.5-7B-Instruct",
-        "mistralai/Mistral-7B-Instruct-v0.3",
-        "HuggingFaceH4/zephyr-7b-beta"
+        "gemma-3-27b-it",
+        "gemini-2.5-flash-lite", 
+        "gemini-1.5-flash"
     ]
 
     DEFAULT_DOT = """
@@ -80,7 +88,22 @@ class AppConfig:
     SYSTEM_PROMPT = f"""
     You are an academic teaching assistant STRICTLY LIMITED to:
     Data Science, Machine Learning, Deep Learning, NLP, and AI.
-
+    
+    CRITICAL FORMATTING RULE (MANDATORY):
+    - EVERY block equation MUST be on its own independent line.
+    - NEVER place text, headings, or markdown on the same line as a block equation ($$...$$).
+    - Use this format ONLY:
+    
+    Text explanation...
+    
+    $$
+    equation here
+    $$
+    
+    Next text block...
+    
+    - Output math variables in standard LaTeX format.
+    
     --------------------------------------------------
     EDUCATION LEVEL RULE (MANDATORY)
     --------------------------------------------------
@@ -104,13 +127,6 @@ class AppConfig:
     7. **When NOT to Use**: Explicit failure cases.
 
     --------------------------------------------------
-    MATH RULE (MANDATORY)
-    --------------------------------------------------
-    - **Block Equations:** Must be wrapped in DOUBLE dollar signs: $$ y = mx + b $$
-    - **Inline Variables:** Must be wrapped in SINGLE dollar signs: "where $m$ is slope"
-    - **Matrices/Complex Math:** ALWAYS wrap `\\begin{{...}}` blocks in `$$ ... $$`.
-
-    --------------------------------------------------
     DIAGRAM RULE (MANDATORY)
     --------------------------------------------------
     You MUST ALWAYS include a diagram.
@@ -128,9 +144,11 @@ class AppConfig:
     }}
     """
 
-if not AppConfig.HF_TOKEN:
-    st.error("🚨 Critical: `HF_TOKEN` missing.")
+if not AppConfig.GEMINI_KEY:
+    st.error("🚨 Critical: `GEMINI_API_KEY` missing. Please get one from Google AI Studio.")
     st.stop()
+
+genai.configure(api_key=AppConfig.GEMINI_KEY)
 
 # --- 3. POLICY ENGINE ---
 def classify_query(query: str):
@@ -153,9 +171,6 @@ def get_llm_service():
     return LLMService()
 
 class LLMService:
-    def __init__(self):
-        self.client = InferenceClient(token=AppConfig.HF_TOKEN)
-
     def _parse_safely(self, raw_text: str) -> dict:
         clean_text = raw_text.strip()
         if clean_text.startswith("```json"):
@@ -173,67 +188,72 @@ class LLMService:
                 return {"explanation": expl, "dot_code": dot}
             raise ValueError("Invalid JSON")
 
-    def _fetch_with_fallback(self, messages, max_tokens, temperature):
-        last_error = None
-        for model_id in AppConfig.MODEL_LIST:
-            try:
-                response = self.client.chat_completion(model=model_id, messages=messages, max_tokens=max_tokens, temperature=temperature)
-                return response.choices[0].message.content
-            except Exception as e:
-                logger.warning(f"Model {model_id} failed: {e}")
-                last_error = e
-                continue
-        raise last_error
-
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(min=1, max=3))
     def query(self, user_prompt: str, level: str) -> AcademicResponse:
         level_instruction = f"EDUCATION_LEVEL = {level}"
-        try:
-            raw = self._fetch_with_fallback(
-                messages=[{"role": "system", "content": AppConfig.SYSTEM_PROMPT}, {"role": "system", "content": level_instruction}, {"role": "user", "content": user_prompt}],
-                max_tokens=4000, temperature=0.3
-            )
-            data = self._parse_safely(raw)
-            resp = AcademicResponse(**data)
-            if not resp.dot_code or str(resp.dot_code).lower() == "null":
-                raise ValueError("Diagram missing.")
-            return resp
-        except Exception as e:
-            if isinstance(e, RetryError): e = e.last_attempt.exception()
-            error_str = str(e).lower()
-            if "402" in error_str or "payment" in error_str:
-                return AcademicResponse(explanation="**🚨 API QUOTA EXCEEDED (Error 402)**\n\nPlease update your Hugging Face Token.", dot_code=AppConfig.DEFAULT_DOT, is_degraded=True, error_type="QUOTA")
-            return AcademicResponse(explanation=f"**System Note:** AI Busy. Try again.", dot_code=AppConfig.DEFAULT_DOT, is_degraded=True)
+        full_prompt = f"{AppConfig.SYSTEM_PROMPT}\n\n{level_instruction}\n\nUSER QUERY: {user_prompt}"
+        
+        last_error = None
+        for model_name in AppConfig.MODEL_LIST:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(full_prompt)
+                data = self._parse_safely(response.text)
+                resp = AcademicResponse(**data)
+                
+                if not resp.dot_code or str(resp.dot_code).lower() == "null":
+                    raise ValueError("Diagram missing.")
+                
+                return resp
+            except Exception as e:
+                logger.warning(f"Model {model_name} failed: {e}")
+                last_error = e
+                continue
 
-# --- 6. ENGINES ---
+        return AcademicResponse(
+            explanation=f"**System Note:** All AI models are currently unavailable. Error: {last_error}",
+            dot_code=AppConfig.DEFAULT_DOT,
+            is_degraded=True
+        )
+
+# --- 6. TEXT PROCESSOR ---
 class TextProcessor:
     @staticmethod
-    def normalize_math(text: str) -> str:
-        # 1. Fix ( x ) -> $x$
-        text = re.sub(r'\(\s*([a-zA-Z0-9_+\-\\^]+|\\[a-zA-Z]+.*?)\s*\)', r'$\1$', text)
-        
-        # 2. Fix Matrices: If \begin{bmatrix} exists but no $$, wrap it in $$
-        # This fixes the "Red Text" matrix issue
-        def wrap_matrix(match):
-            content = match.group(0)
-            if "$$" in content: return content # Already wrapped
-            return f"\n$$\n{content}\n$$\n"
-            
-        text = re.sub(r'\\begin\{[a-z]*matrix\}.*?\\end\{[a-z]*matrix\}', wrap_matrix, text, flags=re.DOTALL)
-        
-        # 3. Standardize Delimiters
-        text = text.replace(r'\[', '$$').replace(r'\]', '$$')
-        text = text.replace(r'\(', '$').replace(r'\)', '$')
-        return text
-
-    @staticmethod
     def clean_leakage(text: str) -> str:
-        # Strip all code blocks to be safe
         text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
-        # Strip raw graph definitions
-        text = re.sub(r'(?:digraph|graph)\s+\w*\s*\{[^}]*\}', '', text, flags=re.DOTALL | re.IGNORECASE)
-        # Strip headers
-        text = re.sub(r'(?:###|##|\*\*)\s*(?:Diagram|Visual Map).*?', '', text, flags=re.IGNORECASE)
-        return text
+        text = re.sub(
+            r'(digraph|graph)\s+\w*\s*\{.*?\}',
+            '',
+            text,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+        # Force math blocks to be isolated
+        text = re.sub(
+            r'(\$\$.*?\$\$)',
+            r'\n\1\n',
+            text,
+            flags=re.DOTALL
+        )
+        return text.strip()
+
+# --- 7. RENDERING LOGIC ---
+def render_content(text: str):
+    """
+    Streamlit-safe renderer:
+    - Math ONLY via st.latex
+    - Text ONLY via st.markdown
+    """
+    blocks = re.split(r'(\$\$.*?\$\$)', text, flags=re.DOTALL)
+
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+
+        if block.startswith('$$') and block.endswith('$$'):
+            st.latex(block[2:-2])
+        else:
+            st.markdown(block)
 
 class DiagramEngine:
     @staticmethod
@@ -241,7 +261,6 @@ class DiagramEngine:
         code = dot_code.strip()
         if not code.endswith("}"): code += "}"
         code = code.replace("$", "").replace("\\", "")
-        # Force white background to prevent black-box PDFs
         layout_config = ' bgcolor="white"; graph [rankdir=LR, nodesep=0.6, ranksep=0.7, splines=true, overlap=false]; node [fontname="Helvetica", shape=box, style="filled", fillcolor="white", color="black"]; edge [fontname="Helvetica"]; '
         if "bgcolor" not in code:
             code = code.replace("{", '{' + layout_config, 1)
@@ -259,71 +278,165 @@ class DiagramEngine:
         try:
             src = graphviz.Source(clean_code)
             raw_svg = src.pipe(format="svg").decode("utf-8")
+            
+            # Ensure SVG scales properly
+            raw_svg = raw_svg.replace("<svg ", '<svg width="100%" height="auto" ')
+            
             return re.sub(r"<script.*?>.*?</script>", "", raw_svg, flags=re.DOTALL|re.IGNORECASE)
         except Exception:
             return None
+
+# --- 8. PDF ENGINE (SAFE STATEFUL HTMLIFY) ---
+def simple_htmlify(text: str) -> str:
+    """
+    Safe text → HTML conversion.
+    - Preserves $$...$$ for MathJax (NO ESCAPING)
+    - Escapes normal text only
+    - Handles lists statefully to create valid <ul> structures
+    """
+    lines = text.split("\n")
+    html_lines = []
+    in_math_block = False
+    in_list = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # 1. Detect pure delimiter line ($$)
+        if stripped == "$$":
+            in_math_block = not in_math_block
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            html_lines.append("$$")
+            continue
+        
+        # 2. Inside math block? Pass raw LaTeX
+        if in_math_block:
+            html_lines.append(line)
+            continue
+            
+        # 3. Single-line block equation? Pass raw LaTeX
+        if stripped.startswith("$$") and stripped.endswith("$$"):
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            html_lines.append(stripped)
+            continue
+
+        # 4. List Handling (Stateful)
+        if stripped.startswith("- "):
+            if not in_list:
+                html_lines.append("<ul>")
+                in_list = True
+            html_lines.append(f"<li>{html.escape(stripped[2:])}</li>")
+            continue
+        else:
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+
+        # 5. Normal Text Formatting
+        if stripped.startswith("###"):
+            html_lines.append(f"<h3>{html.escape(stripped[3:].strip())}</h3>")
+        elif stripped.startswith("##"):
+            html_lines.append(f"<h2>{html.escape(stripped[2:].strip())}</h2>")
+        elif stripped.startswith("#"):
+            html_lines.append(f"<h1>{html.escape(stripped[1:].strip())}</h1>")
+        elif not stripped:
+            # POLISH: Skip empty lines to reduce noise
+            continue
+        else:
+            html_lines.append(f"<p>{html.escape(stripped)}</p>")
+
+    if in_list:
+        html_lines.append("</ul>")
+
+    return "\n".join(html_lines)
 
 class PDFEngine:
     @staticmethod
     def create_html(title: str, body: str, svg: Optional[str]) -> str:
         safe_title = html.escape(title)
-        # Use simpler Alphanumeric UUIDs to survive Markdown parsing
-        math_map = {}
-        def protect_math_block(match):
-            uid = f"MATHBLOCK{uuid.uuid4().hex}END"
-            math_map[uid] = match.group(0)
-            return uid
+        html_body = simple_htmlify(body)
 
-        body = re.sub(r'\$\$.*?\$\$', protect_math_block, body, flags=re.DOTALL)
-        body = re.sub(r'(?<!\$)\$(?!\$).*?(?<!\$)\$(?!\$)', protect_math_block, body)
-
-        html_body = markdown.markdown(body, extensions=['extra', 'tables'])
-
-        for uid, latex_code in math_map.items():
-            safe_latex = latex_code.replace("<", " \\lt ").replace(">", " \\gt ")
-            html_body = html_body.replace(uid, safe_latex)
-        
         return f"""
-        <!DOCTYPE html><html><head><meta charset="utf-8">
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        
+        <script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+
+        
         <script>
-        MathJax = {{
-            tex: {{ inlineMath: [['$', '$'], ['\\\\(', '\\\\)']], displayMath: [['$$', '$$']] }},
-            startup: {{ typeset: true }}
+        window.MathJax = {{
+          tex: {{
+            inlineMath: [['$', '$']],
+            displayMath: [['$$', '$$']],
+            processEscapes: true
+          }},
+          startup: {{
+            typeset: true
+          }}
         }};
         </script>
-        <script async src="[https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-mml-chtml.min.js](https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-mml-chtml.min.js)"></script>
+
         <style>
-            @page {{ size: A4; margin: 2.5cm; }}
-            body {{ font-family: 'Times New Roman', serif; line-height: 1.6; font-size: 12pt; }}
-            h1 {{ text-align: center; color: #004e98; border-bottom: 2px solid #004e98; padding-bottom: 10px; }}
-            .diagram-container {{ text-align: center; margin: 20px 0; }}
-            svg {{ max-width: 100%; height: auto; }}
+        body {{
+          font-family: Helvetica, Arial, sans-serif;
+          line-height: 1.6;
+          max-width: 900px;
+          margin: auto;
+          padding: 30px;
+          color: #333;
+        }}
+        h1 {{
+          text-align: center;
+          border-bottom: 2px solid #004e98;
+          padding-bottom: 10px;
+        }}
+        .diagram {{
+          text-align: center;
+          margin: 30px 0;
+          display: flex;
+          justify-content: center;
+        }}
+        img {{ max-width: 100%; height: auto; }}
         </style>
-        </head><body>
+        </head>
+
+        <body>
             <h1>{safe_title}</h1>
-            <div class="diagram-container">{svg if svg else ""}</div>
-            <div>{html_body}</div>
-        </body></html>
+            <div class="diagram">{svg if svg else ""}</div>
+            {html_body}
+        </body>
+        </html>
         """
 
     @staticmethod
-    async def generate_pdf(html_content: str) -> bytes:
-        browser = get_browser_instance()
-        page = await browser.new_page()
-        await page.set_content(html_content)
+    async def generate_pdf(html_content: str) -> tuple[bytes, str]:
         try:
+            browser = get_browser_instance()
+            page = await browser.new_page()
+            await page.set_content(html_content)
             await page.wait_for_load_state("networkidle")
-            await page.evaluate("MathJax.typesetPromise()")
-            await page.wait_for_timeout(2000) 
+            
+            # POLISH: Safe MathJax Wait
+            await page.evaluate("""
+                if (window.MathJax && MathJax.typesetPromise) {
+                    await MathJax.typesetPromise();
+                }
+            """)
+            await page.wait_for_timeout(3000) 
+            
             pdf = await page.pdf(format="A4", print_background=True)
             await page.close()
-            return pdf
-        except Exception:
-            # FALLBACK: If browser fails, return simple text PDF
-            await page.close()
-            return f"PDF Generation Error. Please copy the text manually.".encode()
+            return pdf, "application/pdf"
+        except Exception as e:
+            return html_content.encode('utf-8'), "text/html"
 
-# --- 7. MAIN UI ---
+# --- 10. MAIN UI ---
 def main():
     st.title("🤖 Intelligent DS Tutor")
     st.caption("Auto-adapts: 🧒 Kid | 🎓 B.Tech | 🔬 M.Tech")
@@ -359,45 +472,40 @@ def main():
         color = "green" if lvl == "KID" else "orange" if lvl == "BTECH" else "red"
         st.markdown(f":{color}[**Mode: {lvl}**]")
 
-        if data.is_degraded:
-            if data.error_type == "QUOTA":
-                st.error(data.explanation)
-            else:
-                st.warning("⚠️ Formatting degraded: The model provided a best-effort response.")
-
+        # --- PIPELINE ---
         clean_text = TextProcessor.clean_leakage(data.explanation)
-        clean_text = TextProcessor.normalize_math(clean_text)
         
-        if len(clean_text) > 8000:
-            clean_text = clean_text[:8000] + "...\n\n*(Response truncated)*"
-
-        chunks = re.split(r'(\$\$.*?\$\$)', clean_text, flags=re.DOTALL)
-        for chunk in chunks:
-            if chunk.startswith('$$'):
-                st.latex(chunk.strip('$'))
-            elif chunk.strip():
-                st.markdown(chunk)
+        # --- UI RENDER ---
+        render_content(clean_text)
 
         st.markdown("---")
         st.markdown("### 🗺️ Visual Map")
         
+        # --- FIX: Safe SVG Isolation ---
         if st.session_state.svg: 
-            # Use standard parameter, suppress warnings globally
-            st.image(st.session_state.svg, use_container_width=True)
+            components.html(
+                f"""
+                <div style="width:100%; text-align:center;">
+                    {st.session_state.svg}
+                </div>
+                """,
+                height=500,
+                scrolling=True
+            )
         elif data.dot_code and not data.is_degraded:
             st.graphviz_chart(DiagramEngine.repair_dot_code(data.dot_code))
+        else:
+            st.info("Diagram unavailable for this response.")
 
-        if st.button("📄 Download PDF"):
-            with st.spinner("Compiling PDF..."):
+        if st.button("📄 Download Report"):
+            with st.spinner("Generating File..."):
                 html_pl = PDFEngine.create_html(st.session_state.last_query, clean_text, st.session_state.svg)
-                try:
-                    pdf = run_async(PDFEngine.generate_pdf(html_pl))
-                    if b"Error" in pdf:
-                         st.error("PDF engine overloaded. Please try again in 1 minute.")
-                    else:
-                        st.download_button("Download", pdf, file_name=f"{lvl}_report.pdf", mime="application/pdf")
-                except Exception:
-                    st.error("PDF generation failed.")
+                file_data, mime_type = run_async(PDFEngine.generate_pdf(html_pl))
+                
+                ext = "pdf" if mime_type == "application/pdf" else "html"
+                label = "Download PDF" if ext == "pdf" else "Download HTML (Offline Viewable)"
+                
+                st.download_button(label, file_data, file_name=f"{lvl}_report.{ext}", mime=mime_type)
 
 if __name__ == "__main__":
     main()
